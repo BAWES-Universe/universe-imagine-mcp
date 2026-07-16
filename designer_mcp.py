@@ -18,6 +18,20 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
+# Load .env file - this is the SOURCE OF TRUTH for config.
+# The watchdog's shell-level export is unreliable (fragile xargs behavior).
+# python-dotenv handles edge cases (spaces, comments, quoting) correctly.
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path, override=False)
+        print(f"[ImagineMCP] Loaded .env from {_env_path}")
+    else:
+        print(f"[ImagineMCP] No .env found at {_env_path}")
+except ImportError:
+    print("[ImagineMCP] python-dotenv not installed - relying on shell environment")
+
 from mcp.server.fastmcp import FastMCP, Context
 
 # Monkey-patch FastMCP's DNS rebinding check — it rejects valid Host headers
