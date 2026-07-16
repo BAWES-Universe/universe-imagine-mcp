@@ -5,8 +5,8 @@ MCP server for AI image generation. Wraps local ComfyUI as a Streamable HTTP MCP
 ## Features
 
 - **Streamable HTTP** — MCP `2024-11-05` protocol, Bearer auth
-- **Async generation** — `generate_image` returns a `job_id` instantly, poll `get_generation_status`
-- **Background queue** — multiple requests accepted immediately, processed one at a time
+- **Synchronous generation** — `generate_image` blocks and returns the image URL directly
+- **Background queue** — multiple requests accepted, processed one at a time
 - **Idempotency keys** — safe retries without duplicates
 - **Player-aware** — reads `player_id` from MCP initialize handshake
 - **Generation history** — SQLite, with `since` filter for incremental queries
@@ -14,6 +14,7 @@ MCP server for AI image generation. Wraps local ComfyUI as a Streamable HTTP MCP
 - **Image serving** — built-in static file server for generated images
 - **Idle watchdog** — stops ComfyUI after 5 minutes of inactivity to free VRAM
 - **Warm start** — ComfyUI starts in background when MCP server boots
+- **Discord webhook** — optional generation notifications
 
 ## Prerequisites
 
@@ -67,21 +68,40 @@ All config goes in `.env`:
 
 ### `generate_image(prompt, width=512, height=512, idempotency_key="")` → JSON
 
-Start generating an image. Returns a `job_id` immediately. Poll `get_generation_status` to check when it's done.
+Generate an image from a text prompt. Blocks until complete (typically 3-15 seconds) and returns the image URL directly. The image is auto-sent to the conversation by the bot.
 
-The `idempotency_key` prevents duplicates on retry — same key = cached result.
-
-### `get_generation_status(generation_id)` → JSON
-
-Poll a generation by ID. Returns status (`processing` / `completed` / `error` / `timeout`) and `image_url` when done.
+Use `idempotency_key` to safely retry without duplicates — same key = cached result.
 
 ### `get_generation(generation_id)` → JSON
 
-Retrieve a past generation's full record.
+Retrieve a past generation's full record by ID.
 
 ### `list_generations(limit=10, since="")` → JSON array
 
 List recent generations for the calling player. Optionally filter by ISO 8601 timestamp.
+
+### `get_generation_status(generation_id)` → JSON (legacy)
+
+Legacy polling tool kept for backwards compatibility. The current `generate_image` is synchronous and returns the URL directly — polling is not needed.
+
+## DNS Rebinding — Monkey Patch
+
+The server includes a monkey-patch for FastMCP's built-in DNS rebinding check (see `designer_mcp.py` lines 23-33). This is needed when running behind a reverse proxy or Cloudflare tunnel where the incoming `Host` header (e.g., `imagine.yourdomain.com`) doesn't match `localhost`.
+
+**If you're running behind a reverse proxy:** The patch is safe because auth is handled by the `BearerAuthMiddleware`. Keep it.
+
+**If you're running on localhost only (no tunnel/proxy):** Remove the patch entirely — delete lines 23-33 from `designer_mcp.py`.
+
+The patch:
+```python
+from mcp.server.transport_security import TransportSecurityMiddleware
+
+_orig_validate = TransportSecurityMiddleware.validate_request
+async def _patched_validate(self, request, is_post=False):
+    return None  # Skip Host header validation
+
+TransportSecurityMiddleware.validate_request = _patched_validate
+```
 
 ## Connecting to a Universe Bot
 

@@ -8,7 +8,7 @@ Streamable HTTP MCP server wrapping local ComfyUI.
   - Player ID from MCP initialize handshake (clientInfo.player_id)
   - SQLite for generation history
   - Discord webhook on generation (optional)
-  - Async generation with job polling
+  - Synchronous generation (blocks until image ready, returns URL)
   - Idempotency key for safe retries
   - Background worker queue (processes one at a time)
 """
@@ -70,7 +70,9 @@ CFG   = 3.5
 
 # Background worker queue — accepts all requests, processes one at a time
 _generation_queue = queue.Queue()
-_queue_worker_started = False
+_generation_results: dict[str, dict] = {}
+_generation_events: dict[str, threading.Event] = {}
+_results_lock = threading.Lock()
 
 # ComfyUI lifecycle
 COMFYUI_DIR = os.path.expanduser(os.environ.get("COMFYUI_DIR", "~/ComfyUI"))
@@ -318,11 +320,31 @@ def _run_generation(gen_id: str, prompt: str, seed: int,
             except Exception:
                 pass
 
+            # Build result dict with image URL
+            image_url = f"{PUBLIC_URL_BASE}/images/{Path(image_path).name}" if PUBLIC_URL_BASE else ""
+            result = {
+                "status": "completed",
+                "image_url": image_url,
+                "image_path": image_path,
+                "prompt": generation["prompt"],
+                "seed": generation["seed"],
+                "width": generation["width"],
+                "height": generation["height"],
+            }
+            with _results_lock:
+                _generation_results[gen_id] = result
+                if gen_id in _generation_events:
+                    _generation_events[gen_id].set()
+
             _last_gen_time = time.time()
             print(f"[ImagineMCP] Generation {gen_id[:8]} completed: {Path(image_path).name}")
         else:
             db.execute("UPDATE generations SET status = 'timeout' WHERE id = ?", (gen_id,))
             db.commit()
+            with _results_lock:
+                _generation_results[gen_id] = {"status": "timeout", "error": "Generation timed out"}
+                if gen_id in _generation_events:
+                    _generation_events[gen_id].set()
             _last_gen_time = time.time()
             print(f"[ImagineMCP] Generation {gen_id[:8]} timed out")
     except Exception as e:
@@ -333,6 +355,10 @@ def _run_generation(gen_id: str, prompt: str, seed: int,
             db.commit()
         except Exception:
             pass
+        with _results_lock:
+            _generation_results[gen_id] = {"status": "error", "error": str(e)}
+            if gen_id in _generation_events:
+                _generation_events[gen_id].set()
     finally:
         db.close()
 
@@ -368,10 +394,10 @@ def _generation_worker():
 mcp = FastMCP(
     "Imagine",
     instructions=(
-        "Generate images using a local ComfyUI model. "
-        "Defaults to 512x512, 4 steps. Returns a job ID immediately — poll "
-        "get_generation_status for the result. "
-        "The image is auto-sent to the conversation when ready."
+        "Generate images from text prompts. "
+        "512x512 default. The image is auto-sent to the conversation when ready. "
+        "Do NOT describe the image generation process to the user — "
+        "just tell them the image is coming and wait."
     ),
     streamable_http_path="/mcp",
     json_response=True,
@@ -386,17 +412,15 @@ def generate_image(
     idempotency_key: str = "",
 ) -> str:
     """
-    Generate an image from a text prompt using ComfyUI.
+    Generate an image from a text prompt.
 
-    Starts generation and returns a job ID immediately. Poll
-    get_generation_status(job_id) to check when the image is ready
-    (typically 3-15 seconds). The image is auto-sent to the conversation
-    when get_generation_status returns 'completed'.
+    Returns immediately with the image URL when done (typically 3-15 seconds).
+    The image is auto-sent to the conversation automatically.
 
     Provide an idempotency_key to safely retry without creating duplicates.
     If the same key was used before, returns the cached result.
 
-    Defaults to 512x512, 4 sampling steps.
+    Defaults to 512x512. Do NOT poll or call get_generation_status.
     """
     # 1. Get player identity from MCP handshake
     player_id = "unknown"
@@ -450,14 +474,30 @@ def generate_image(
         )
         db.commit()
 
-        # 6. Queue for background worker (processes one at a time)
+        # 6. Create event + queue for background worker
+        event = threading.Event()
+        with _results_lock:
+            _generation_events[gen_id] = event
         _generation_queue.put(gen_id)
 
-        return json.dumps({
-            "job_id": gen_id,
-            "status": "processing",
-            "estimated_seconds": 15,
-        })
+        # 7. Block until the generation completes (up to 60s timeout)
+        # The bot's MCP timeout is 60s; cold start ~15-20s, warm ~4-5s.
+        if not event.wait(timeout=60):
+            return json.dumps({
+                "status": "timeout",
+                "error": "Generation timed out after 60 seconds",
+            })
+
+        # 8. Read the result from the worker
+        with _results_lock:
+            result = _generation_results.pop(gen_id, None)
+            _generation_events.pop(gen_id, None)
+
+        if result and result["status"] == "completed":
+            return json.dumps(result)
+        elif result:
+            return json.dumps({"status": result["status"], "error": result.get("error", "Generation failed")})
+        return json.dumps({"status": "error", "error": "Generation failed"})
     finally:
         db.close()
 
@@ -465,7 +505,7 @@ def generate_image(
 @mcp.tool()
 def get_generation_status(ctx: Context, generation_id: str) -> str:
     """
-    Poll generation status by job ID.
+    (Legacy) Poll generation status by job ID.
 
     Returns the current status ('processing', 'completed', 'error', 'timeout').
     When completed, includes the image_url and generation metadata.
