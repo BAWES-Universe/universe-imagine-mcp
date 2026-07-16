@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Imagine MCP — image generation for bots.
+Imagine MCP — image creation for bots.
 
 Streamable HTTP MCP server wrapping local ComfyUI.
   - Python + FastMCP
   - Streamable HTTP at /mcp, Bearer token auth
   - Player ID from MCP initialize handshake (clientInfo.player_id)
-  - SQLite for generation history
-  - Discord webhook on generation (optional)
-  - Synchronous generation (blocks until image ready, returns URL)
+  - SQLite for imagine history
+  - Discord webhook on imagine (optional)
+  - Synchronous (blocks until image ready (blocks until image ready, returns URL)
   - Idempotency key for safe retries
   - Background worker queue (processes one at a time)
 """
@@ -83,16 +83,16 @@ STEPS = 4
 CFG   = 3.5
 
 # Background worker queue — accepts all requests, processes one at a time
-_generation_queue = queue.Queue()
-_generation_results: dict[str, dict] = {}
-_generation_events: dict[str, threading.Event] = {}
-_results_lock = threading.Lock()
+_imagine_queue = queue.Queue()
+_imagine_results: dict[str, dict] = {}
+_imagine_events: dict[str, threading.Event] = {}
+_imagine_lock = threading.Lock()
 
 # ComfyUI lifecycle
 COMFYUI_DIR = os.path.expanduser(os.environ.get("COMFYUI_DIR", "~/ComfyUI"))
 IDLE_TIMEOUT = 300  # 5 minutes
 _comfyui_process = None
-_last_gen_time = time.time()
+_last_imagine_time = time.time()
 _backend_start_time = time.time()
 
 def _comfyui_running() -> bool:
@@ -103,11 +103,11 @@ def _comfyui_running() -> bool:
         return False
 
 def _start_comfyui() -> bool:
-    global _comfyui_process, _last_gen_time
+    global _comfyui_process, _last_imagine_time
     if _comfyui_running():
         return True
     print("[ImagineMCP] Starting ComfyUI...")
-    _last_gen_time = time.time()
+    _last_imagine_time = time.time()
     _comfyui_process = subprocess.Popen(
         [f"{COMFYUI_DIR}/venv/bin/python", "main.py",
          "--listen", "127.0.0.1", "--port", "8188",
@@ -134,10 +134,10 @@ def _stop_comfyui():
             pass
 
 def _idle_watchdog():
-    global _last_gen_time
+    global _last_imagine_time
     while True:
         time.sleep(30)
-        idle = time.time() - _last_gen_time
+        idle = time.time() - _last_imagine_time
         if idle > IDLE_TIMEOUT and _comfyui_running():
             print(f"[ImagineMCP] Idle {int(idle)}s, stopping ComfyUI")
             _stop_comfyui()
@@ -183,7 +183,7 @@ def send_discord(generation: dict):
     if not DISCORD_WEBHOOK_URL:
         return False
     embed = {
-        "title": "🎨 Generation Complete",
+        "title": "🎨 Imagine Complete",
         "color": 0x9B59B6,
         "fields": [
             {"name": "Player", "value": generation["player_id"][:12] + "...", "inline": True},
@@ -192,7 +192,7 @@ def send_discord(generation: dict):
             {"name": "Seed",   "value": str(generation.get("seed", "N/A")), "inline": True},
             {"name": "Created", "value": generation["created_at"], "inline": False},
         ],
-        "footer": {"text": f"Generation {generation['id'][:8]}"},
+        "footer": {"text": f"Imagine {generation['id'][:8]}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -299,12 +299,12 @@ def wait_for_image(prompt_id: str, timeout_secs: int = 120) -> str | None:
     return None
 
 # ---------------------------------------------------------------------------
-# Background generation worker
+# Background imagine worker
 # ---------------------------------------------------------------------------
 
-def _run_generation(gen_id: str, prompt: str, seed: int,
+def _run_imagine(gen_id: str, prompt: str, seed: int,
                     width: int, height: int):
-    """Run a generation in a background thread and update the DB when done."""
+    """Run an imagine in a background thread and update the DB when done."""
     db = get_db()
     try:
         wf = build_workflow(prompt, seed, gen_id, width, height)
@@ -345,42 +345,42 @@ def _run_generation(gen_id: str, prompt: str, seed: int,
                 "width": generation["width"],
                 "height": generation["height"],
             }
-            with _results_lock:
-                _generation_results[gen_id] = result
-                if gen_id in _generation_events:
-                    _generation_events[gen_id].set()
+            with _imagine_lock:
+                _imagine_results[gen_id] = result
+                if gen_id in _imagine_events:
+                    _imagine_events[gen_id].set()
 
-            _last_gen_time = time.time()
-            print(f"[ImagineMCP] Generation {gen_id[:8]} completed: {Path(image_path).name}")
+            _last_imagine_time = time.time()
+            print(f"[ImagineMCP] Imagine {gen_id[:8]} completed: {Path(image_path).name}")
         else:
             db.execute("UPDATE generations SET status = 'timeout' WHERE id = ?", (gen_id,))
             db.commit()
-            with _results_lock:
-                _generation_results[gen_id] = {"status": "timeout", "error": "Generation timed out"}
-                if gen_id in _generation_events:
-                    _generation_events[gen_id].set()
-            _last_gen_time = time.time()
-            print(f"[ImagineMCP] Generation {gen_id[:8]} timed out")
+            with _imagine_lock:
+                _imagine_results[gen_id] = {"status": "timeout", "error": "Imagine timed out"}
+                if gen_id in _imagine_events:
+                    _imagine_events[gen_id].set()
+            _last_imagine_time = time.time()
+            print(f"[ImagineMCP] Imagine {gen_id[:8]} timed out")
     except Exception as e:
-        print(f"[ImagineMCP] Generation {gen_id[:8]} failed: {e}")
+        print(f"[ImagineMCP] Imagine {gen_id[:8]} failed: {e}")
         try:
             db.execute("UPDATE generations SET status = 'error', metadata_json = ? WHERE id = ?",
                        (json.dumps({"error": str(e)}), gen_id))
             db.commit()
         except Exception:
             pass
-        with _results_lock:
-            _generation_results[gen_id] = {"status": "error", "error": str(e)}
-            if gen_id in _generation_events:
-                _generation_events[gen_id].set()
+        with _imagine_lock:
+            _imagine_results[gen_id] = {"status": "error", "error": str(e)}
+            if gen_id in _imagine_events:
+                _imagine_events[gen_id].set()
     finally:
         db.close()
 
 
-def _generation_worker():
-    """Background worker: processes queued generations one at a time."""
+def _imagine_worker():
+    """Background worker: processes queued imagines one at a time."""
     while True:
-        gen_id = _generation_queue.get()
+        gen_id = _imagine_queue.get()
         try:
             db = get_db()
             row = db.execute(
@@ -390,7 +390,7 @@ def _generation_worker():
             if not row:
                 continue
             gen = dict(row)
-            _run_generation(
+            _run_imagine(
                 gen_id=gen["id"],
                 prompt=gen["prompt"],
                 seed=gen["seed"],
@@ -408,17 +408,16 @@ def _generation_worker():
 mcp = FastMCP(
     "Imagine",
     instructions=(
-        "Generate images from text prompts. "
-        "512x512 default. The image is auto-sent to the conversation when ready. "
-        "Do NOT describe the image generation process to the user — "
-        "just tell them the image is coming and wait."
+        "Create images from text prompts. "
+        "512x512. The image is auto-sent to the conversation when ready. "
+        "Do NOT describe the image creation process or internal details."
     ),
     streamable_http_path="/mcp",
     json_response=True,
 )
 
 @mcp.tool()
-def generate_image(
+def imagine(
     ctx: Context,
     prompt: str,
     width: int = DEFAULT_WIDTH,
@@ -426,7 +425,7 @@ def generate_image(
     idempotency_key: str = "",
 ) -> str:
     """
-    Generate an image from a text prompt.
+    Create an image from a text prompt.
 
     Returns immediately with the image URL when done (typically 3-15 seconds).
     The image is auto-sent to the conversation automatically.
@@ -434,7 +433,7 @@ def generate_image(
     Provide an idempotency_key to safely retry without creating duplicates.
     If the same key was used before, returns the cached result.
 
-    Defaults to 512x512. Do NOT poll or call get_generation_status.
+    Defaults to 512x512.
     """
     # 1. Get player identity from MCP handshake
     player_id = "unknown"
@@ -467,9 +466,9 @@ def generate_image(
     if not _comfyui_running():
         return json.dumps({
             "error_type": "service_unavailable",
-            "error": "Generation backend is starting up",
+            "error": "Image backend is starting up",
             "estimated_wait_seconds": 15,
-            "retry_suggestion": "Call generate_image again in a few seconds",
+            "retry_suggestion": "Call imagine again in a few seconds",
         })
 
     # 4. (No concurrency check — all requests accepted, queued for background worker)
@@ -490,81 +489,36 @@ def generate_image(
 
         # 6. Create event + queue for background worker
         event = threading.Event()
-        with _results_lock:
-            _generation_events[gen_id] = event
-        _generation_queue.put(gen_id)
+        with _imagine_lock:
+            _imagine_events[gen_id] = event
+        _imagine_queue.put(gen_id)
 
         # 7. Block until the generation completes (up to 60s timeout)
         # The bot's MCP timeout is 60s; cold start ~15-20s, warm ~4-5s.
         if not event.wait(timeout=60):
             return json.dumps({
                 "status": "timeout",
-                "error": "Generation timed out after 60 seconds",
+                "error": "Imagine timed out after 60 seconds",
             })
 
         # 8. Read the result from the worker
-        with _results_lock:
-            result = _generation_results.pop(gen_id, None)
-            _generation_events.pop(gen_id, None)
+        with _imagine_lock:
+            result = _imagine_results.pop(gen_id, None)
+            _imagine_events.pop(gen_id, None)
 
         if result and result["status"] == "completed":
             return json.dumps(result)
         elif result:
-            return json.dumps({"status": result["status"], "error": result.get("error", "Generation failed")})
-        return json.dumps({"status": "error", "error": "Generation failed"})
+            return json.dumps({"status": result["status"], "error": result.get("error", "Imagine failed")})
+        return json.dumps({"status": "error", "error": "Imagine failed"})
     finally:
         db.close()
 
 
 @mcp.tool()
-def get_generation_status(ctx: Context, generation_id: str) -> str:
+def list_imagines(ctx: Context, limit: int = 10, since: str = "") -> str:
     """
-    (Legacy) Poll generation status by job ID.
-
-    Returns the current status ('processing', 'completed', 'error', 'timeout').
-    When completed, includes the image_url and generation metadata.
-    Call this after generate_image() to check when the image is ready.
-    """
-    db = get_db()
-    row = db.execute(
-        "SELECT * FROM generations WHERE id = ?",
-        (generation_id,),
-    ).fetchone()
-    db.close()
-
-    if not row:
-        return json.dumps({"error": f"Generation {generation_id} not found"})
-
-    result = dict(row)
-    if result.get("image_path"):
-        result["image_url"] = f"{PUBLIC_URL_BASE}/images/{Path(result['image_path']).name}"
-    return json.dumps(result, default=str)
-
-
-@mcp.tool()
-def get_generation(ctx: Context, generation_id: str) -> str:
-    """
-    Retrieve a past generation by its ID.
-
-    Returns the prompt, image path, seed, status, and timestamps.
-    """
-    db = get_db()
-    row = db.execute("SELECT * FROM generations WHERE id = ?", (generation_id,)).fetchone()
-    db.close()
-
-    if not row:
-        return json.dumps({"error": f"Generation {generation_id} not found"})
-
-    result = dict(row)
-    if result.get("image_path"):
-        result["image_url"] = f"{PUBLIC_URL_BASE}/images/{Path(result['image_path']).name}"
-    return json.dumps(result, default=str)
-
-
-@mcp.tool()
-def list_generations(ctx: Context, limit: int = 10, since: str = "") -> str:
-    """
-    List recent generations for the current player.
+    List recent imagines for the current player.
 
     Returns the most recent generations first, newest first.
     Optionally filter by ISO 8601 timestamp (since) to only return
@@ -659,7 +613,7 @@ async def _health_endpoint(request):
     return JSONResponse({
         "status": "ok" if backend_ready else "warming",
         "backend_ready": backend_ready,
-        "active_jobs": _generation_queue.qsize(),
+        "active_jobs": _imagine_queue.qsize(),
         "max_concurrent": 1,
         "uptime_seconds": int(time.time() - _backend_start_time),
     })
@@ -680,8 +634,8 @@ if __name__ == "__main__":
     # Warm-start: begin ComfyUI startup immediately (doesn't block uvicorn)
     threading.Thread(target=_start_comfyui, daemon=True).start()
 
-    # Background worker: processes queued generations one at a time
-    threading.Thread(target=_generation_worker, daemon=True).start()
+    # Background worker: processes queued imagines one at a time
+    threading.Thread(target=_imagine_worker, daemon=True).start()
 
     _backend_start_time = time.time()
 
