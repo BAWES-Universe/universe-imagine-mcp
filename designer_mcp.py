@@ -381,6 +381,8 @@ def _imagine_worker():
     """Background worker: processes queued imagines one at a time."""
     while True:
         gen_id = _imagine_queue.get()
+        # Ensure ComfyUI is running (idle watchdog may have killed it)
+        _start_comfyui()
         try:
             db = get_db()
             row = db.execute(
@@ -462,14 +464,9 @@ def imagine(
             return json.dumps(result, default=str)
         db.close()
 
-    # 3. Check backend readiness — return retry signal if not ready
-    if not _comfyui_running():
-        return json.dumps({
-            "error_type": "service_unavailable",
-            "error": "Image backend is starting up",
-            "estimated_wait_seconds": 15,
-            "retry_suggestion": "Call imagine again in a few seconds",
-        })
+    # 3. Ensure ComfyUI is running (blocks until ready, up to 60s cold start)
+    #    No "service_unavailable" early return — the LLM anthropomorphizes it.
+    _start_comfyui()
 
     # 4. (No concurrency check — all requests accepted, queued for background worker)
 
